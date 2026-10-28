@@ -1,4 +1,4 @@
-import type { Insurer, Process, Subprocess, WorkspaceState } from './types';
+import { newId, type Insurer, type Process, type Subprocess, type WorkspaceState } from './types';
 
 const uuid = (n: number) => `00000000-0000-4000-8000-${n.toString(16).padStart(12, '0')}`;
 
@@ -36,10 +36,16 @@ const subprocesses: Subprocess[] = lifecycle.flatMap(([, , steps], pi) => steps.
   id: uuid(200 + pi * 20 + si), processId: processes[pi]!.id, name, description: '', order: si, archived: false,
 })));
 
-export function createSeedState(): WorkspaceState {
+export function createSeedState(caseName = 'example-insurer'): WorkspaceState {
+  const workspaceInsurers = structuredClone(insurers).map((insurer) => ({
+    ...insurer,
+    id: caseName === 'example-insurer' ? insurer.id : newId(),
+    name: caseName,
+    description: caseName === 'example-insurer' ? insurer.description : 'Illustrative GHI benchmark workspace.',
+  }));
   return {
-    schemaVersion: 1, insurers: structuredClone(insurers), processes: structuredClone(processes), subprocesses: structuredClone(subprocesses),
-    assessments: insurers.flatMap((insurer) => subprocesses.map((subprocess, subprocessIndex) => ({
+    schemaVersion: 1, insurers: workspaceInsurers, processes: structuredClone(processes), subprocesses: structuredClone(subprocesses),
+    assessments: workspaceInsurers.flatMap((insurer) => subprocesses.map((subprocess, subprocessIndex) => ({
       id: uuid(2_000 + subprocessIndex), insurerId: insurer.id, subprocessId: subprocess.id,
       existence: 'Not Assessed' as const, confidence: 'Unverified' as const, technologyCategory: '', vendor: '', automation: 'Unknown' as const,
       notes: '', verifiedAt: null, updatedAt: null, owner: '',

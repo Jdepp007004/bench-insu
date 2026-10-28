@@ -1,6 +1,6 @@
 # Bench-Suite — GHI Benchmark
 
-A focused, Figma-inspired workspace for editing one illustrative GHI benchmark case, its processes and subprocesses, and the workflow graph. The default case is named `example-insurer`; its seeded process template is illustrative and contains no real company findings.
+A focused, Figma-inspired benchmark suite with multiple workspaces. Each workspace has its own GHI benchmark case, editable processes and subprocesses, and workflow graph. The initial workspace is named `Example workspace` and its case `example-insurer`; seeded content is illustrative and contains no real company findings.
 
 ## Run locally
 
@@ -9,7 +9,7 @@ npm install
 npm run dev
 ```
 
-For local preview, sign in with any of `pankaj`, `sakshi`, `dheeraj`, or `vaibhav`. The shared demo password is `1234`. The workspace is stored in IndexedDB and updates between tabs in the same browser. Browser cache alone does not sync across devices or people.
+For local preview, sign in with any of `pankaj`, `sakshi`, `dheeraj`, or `vaibhav`. The shared demo password is `1234`. Workspaces and their data are stored together in IndexedDB and update between tabs in the same browser. Browser cache alone does not sync across devices or people. Create and switch workspaces from the sidebar; deletion asks for confirmation, and the final workspace cannot be deleted.
 
 ## Share updates across users
 
@@ -27,7 +27,9 @@ The app is a Vite SPA. `vercel.json` configures the build, output, and fallback 
 
 ## Included
 
-- One example case: `example-insurer`.
+- Multiple workspaces, each with its own benchmark case and process template.
+- Create, switch, and delete workspaces; deleting the final workspace is disabled.
+- The initial example case: `example-insurer`.
 - Editable processes and subprocesses, with add, edit, and archive controls.
 - Benchmark status, automation, and a simple notes field per step.
 - Plain pain-point notes per step, without severity scoring or a separate analysis page.

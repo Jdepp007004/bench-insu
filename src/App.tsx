@@ -13,13 +13,14 @@ import {
 import { assessmentFor, csvEscape, priorityScore, subprocessRef } from './logic';
 import {
   getCurrentUser, loadWorkspace, remoteEnabled, saveWorkspace, signIn, signOut, sourceLabel, subscribeWorkspace,
-  type WorkspaceSnapshot,
+  type WorkspaceRecord, type WorkspaceSnapshot,
 } from './storage';
 import {
   AUTOMATION_OPTIONS, CONFIDENCE_OPTIONS, EXISTENCE_OPTIONS, SEVERITY_OPTIONS, VALIDATION_OPTIONS, newId,
   type Assessment, type Confidence, type EvidenceItem, type HistoryEntry, type Insurer, type PainPoint,
   type Process, type SectionId, type Subprocess, type User, type WorkflowConnection, type WorkspaceState,
 } from './types';
+import { createSeedState } from './data';
 
 type HistoryType = HistoryEntry['entityType'];
 type CommitMeta = { type: HistoryType; id: string; insurerId?: string | null; summary: string };
@@ -87,7 +88,10 @@ function App() {
   const [user, setUser] = useState<User | null>(null);
   const [authLoading, setAuthLoading] = useState(true);
   const [appLoading, setAppLoading] = useState(false);
-  const [workspace, setWorkspace] = useState<WorkspaceState | null>(null);
+  const [workspaceDirectory, setWorkspaceDirectory] = useState<WorkspaceSnapshot | null>(null);
+  const directoryRef = useRef<WorkspaceSnapshot | null>(null);
+  const [activeWorkspaceId, setActiveWorkspaceId] = useState('');
+  const activeWorkspaceIdRef = useRef('');
   const stateRef = useRef<WorkspaceState | null>(null);
   const revisionRef = useRef(0);
   const saveQueue = useRef<Promise<void>>(Promise.resolve());
@@ -103,6 +107,21 @@ function App() {
   const [toast, setToast] = useState('');
   const [mobileNav, setMobileNav] = useState(false);
 
+  const activateWorkspace = useCallback((workspaceId: string, records: WorkspaceRecord[]) => {
+    const record = records.find((item) => item.id === workspaceId);
+    if (!record) return;
+    activeWorkspaceIdRef.current = workspaceId;
+    setActiveWorkspaceId(workspaceId);
+    if (user) {
+      try { localStorage.setItem(`bench-suite-active-workspace-${user.id}`, workspaceId); } catch { /* Keep the selection in memory if browser storage is unavailable. */ }
+    }
+    stateRef.current = record.state;
+    setSelectedInsurerId(record.state.insurers.find((item) => item.id === 'example-insurer')?.id ?? record.state.insurers[0]?.id ?? '');
+    setExpandedProcesses(record.state.processes.filter((process) => !process.archived).slice(0, 2).map((process) => process.id));
+    setOpenSubprocessId(null);
+    setActivePage('lifecycle');
+  }, [user]);
+
   useEffect(() => {
     let alive = true;
     getCurrentUser().then((current) => { if (alive) setUser(current); })
@@ -117,40 +136,119 @@ function App() {
     setAppLoading(true);
     loadWorkspace().then((snapshot) => {
       if (!alive) return;
-      stateRef.current = snapshot.state; revisionRef.current = snapshot.revision;
-      setWorkspace(snapshot.state); setAppLoading(false);
-      setSelectedInsurerId(snapshot.state.insurers.find((item) => item.id === 'example-insurer')?.id ?? snapshot.state.insurers[0]?.id ?? '');
-      setExpandedProcesses(snapshot.state.processes.filter((process) => !process.archived).slice(0, 2).map((process) => process.id));
+      directoryRef.current = snapshot; revisionRef.current = snapshot.revision;
+      setWorkspaceDirectory(snapshot);
+      let preferredId = '';
+      try { preferredId = localStorage.getItem(`bench-suite-active-workspace-${user.id}`) ?? ''; } catch { /* Use the default workspace. */ }
+      const active = snapshot.workspaces.find((item) => item.id === preferredId) ?? snapshot.workspaces[0];
+      if (active) activateWorkspace(active.id, snapshot.workspaces);
+      setAppLoading(false);
     }).catch((error: Error) => { if (alive) { setSaveError(error.message); setSaveStatus('error'); setAppLoading(false); } });
     const unsubscribe = subscribeWorkspace((snapshot: WorkspaceSnapshot) => {
       if (!alive || snapshot.revision <= revisionRef.current) return;
-      stateRef.current = snapshot.state; revisionRef.current = snapshot.revision;
-      setWorkspace(snapshot.state); setSaveStatus('saved'); setSaveError('');
+      directoryRef.current = snapshot; revisionRef.current = snapshot.revision;
+      setWorkspaceDirectory(snapshot);
+      const active = snapshot.workspaces.find((item) => item.id === activeWorkspaceIdRef.current);
+      if (active) stateRef.current = active.state;
+      else if (snapshot.workspaces[0]) activateWorkspace(snapshot.workspaces[0].id, snapshot.workspaces);
+      setSaveStatus('saved'); setSaveError('');
     });
     return () => { alive = false; unsubscribe(); };
-  }, [user?.id]);
+  }, [user?.id, activateWorkspace]);
 
   const commit = useCallback<Commit>((update, meta) => {
     if (!user) return;
     saveQueue.current = saveQueue.current.catch(() => undefined).then(async () => {
       const base = stateRef.current;
-      if (!base) return;
+      const directory = directoryRef.current;
+      const workspaceId = activeWorkspaceIdRef.current;
+      if (!base || !directory) return;
       const next = pushHistory(update(base), meta, user);
+      const nextDirectory = {
+        ...directory,
+        workspaces: directory.workspaces.map((record) => record.id === workspaceId ? { ...record, state: next } : record),
+      };
+      directoryRef.current = nextDirectory;
+      stateRef.current = next;
+      setWorkspaceDirectory(nextDirectory);
       setSaveStatus('saving'); setSaveError('');
       try {
-        const nextRevision = await saveWorkspace(next, revisionRef.current, user);
-        revisionRef.current = nextRevision; stateRef.current = next; setWorkspace(next); setSaveStatus('saved');
+        const nextRevision = await saveWorkspace(nextDirectory, revisionRef.current, user);
+        const savedDirectory = { ...nextDirectory, revision: nextRevision, updatedBy: user.id };
+        revisionRef.current = nextRevision; directoryRef.current = savedDirectory; setWorkspaceDirectory(savedDirectory); setSaveStatus('saved');
       } catch (error) {
         setSaveStatus('error'); setSaveError(error instanceof Error ? error.message : 'The change could not be saved.');
         if (remoteEnabled) {
           try {
-            const latest = await loadWorkspace(); revisionRef.current = latest.revision; stateRef.current = latest.state; setWorkspace(latest.state);
+            const latest = await loadWorkspace();
+            revisionRef.current = latest.revision; directoryRef.current = latest; setWorkspaceDirectory(latest);
+            const active = latest.workspaces.find((record) => record.id === activeWorkspaceIdRef.current) ?? latest.workspaces[0];
+            if (active) activateWorkspace(active.id, latest.workspaces);
           } catch { /* Keep the visible save error for the researcher. */ }
         }
       }
     });
-  }, [user]);
+  }, [user, activateWorkspace]);
 
+  const updateWorkspaceDirectory = useCallback((
+    update: (records: WorkspaceRecord[]) => WorkspaceRecord[],
+    chooseActive: (records: WorkspaceRecord[], currentId: string) => string,
+  ) => {
+    if (!user) return;
+    saveQueue.current = saveQueue.current.catch(() => undefined).then(async () => {
+      const current = directoryRef.current;
+      if (!current) return;
+      const records = update(current.workspaces);
+      if (!records.length) { setToast('Keep at least one workspace.'); return; }
+      const nextDirectory = { ...current, workspaces: records };
+      const nextActiveId = chooseActive(records, activeWorkspaceIdRef.current);
+      directoryRef.current = nextDirectory;
+      setWorkspaceDirectory(nextDirectory);
+      if (nextActiveId !== activeWorkspaceIdRef.current) activateWorkspace(nextActiveId, records);
+      setSaveStatus('saving'); setSaveError('');
+      try {
+        const nextRevision = await saveWorkspace(nextDirectory, revisionRef.current, user);
+        const savedDirectory = { ...nextDirectory, revision: nextRevision, updatedBy: user.id };
+        revisionRef.current = nextRevision; directoryRef.current = savedDirectory; setWorkspaceDirectory(savedDirectory); setSaveStatus('saved');
+      } catch (error) {
+        setSaveStatus('error'); setSaveError(error instanceof Error ? error.message : 'The workspace change could not be saved.');
+        if (remoteEnabled) {
+          try {
+            const latest = await loadWorkspace();
+            revisionRef.current = latest.revision; directoryRef.current = latest; setWorkspaceDirectory(latest);
+            const active = latest.workspaces.find((record) => record.id === activeWorkspaceIdRef.current) ?? latest.workspaces[0];
+            if (active) activateWorkspace(active.id, latest.workspaces);
+          } catch { /* Keep the visible save error for the researcher. */ }
+        }
+      }
+    });
+  }, [user, activateWorkspace]);
+
+  const createWorkspace = (name: string) => {
+    const cleanName = name.trim();
+    if (!cleanName) return false;
+    if (directoryRef.current?.workspaces.some((record) => record.name.toLowerCase() === cleanName.toLowerCase())) {
+      setToast('A workspace with that name already exists.');
+      return false;
+    }
+    const record: WorkspaceRecord = { id: newId(), name: cleanName, state: createSeedState(cleanName) };
+    updateWorkspaceDirectory((records) => [...records, record], () => record.id);
+    return true;
+  };
+
+  const deleteWorkspace = (workspaceId: string) => {
+    const current = directoryRef.current;
+    const target = current?.workspaces.find((record) => record.id === workspaceId);
+    if (!current || !target || current.workspaces.length <= 1) return;
+    if (!window.confirm(`Delete “${target.name}” and all of its benchmark data? This cannot be undone.`)) return;
+    updateWorkspaceDirectory(
+      (records) => records.filter((record) => record.id !== workspaceId),
+      (records, currentId) => currentId === workspaceId ? records[0]?.id ?? '' : currentId,
+    );
+  };
+
+  const workspace = workspaceDirectory?.workspaces.find((record) => record.id === activeWorkspaceId)?.state ?? null;
+  const activeWorkspace = workspaceDirectory?.workspaces.find((record) => record.id === activeWorkspaceId);
   const activeInsurers = workspace?.insurers ?? [];
   const selectedInsurer = activeInsurers.find((insurer) => insurer.id === selectedInsurerId) ?? activeInsurers[0];
   const sortedProcesses = useMemo(() => (workspace?.processes ?? []).filter((process) => !process.archived).sort((a, b) => a.order - b.order), [workspace?.processes]);
@@ -191,7 +289,8 @@ function App() {
   };
 
   const doSignOut = async () => {
-    await signOut(); setUser(null); setWorkspace(null); stateRef.current = null; setActivePage('lifecycle');
+    await signOut(); setUser(null); setWorkspaceDirectory(null); directoryRef.current = null; stateRef.current = null;
+    activeWorkspaceIdRef.current = ''; setActiveWorkspaceId(''); setActivePage('lifecycle');
   };
 
   if (authLoading) return <Loading label="Checking your Bench-Suite workspace…" />;
@@ -206,7 +305,13 @@ function App() {
     <div className={`sidebar-wrap ${mobileNav ? 'shown' : ''}`}>
       <aside className="sidebar">
         <div className="brand-row"><div className="brand-mark"><Sparkles size={17} /></div><div><div className="brand-name">Bench-Suite</div><div className="brand-sub">GHI BENCHMARK</div></div><button className="icon-button sidebar-close" aria-label="Close navigation" onClick={() => setMobileNav(false)}><X size={17} /></button></div>
-        <div className="workspace-chip"><div className="workspace-avatar">B</div><div className="workspace-label"><strong>Example workspace</strong><span>Shared benchmark</span></div></div>
+        <WorkspaceSwitcher
+          workspaces={workspaceDirectory?.workspaces ?? []}
+          activeWorkspaceId={activeWorkspaceId}
+          onSelect={(id) => activateWorkspace(id, workspaceDirectory?.workspaces ?? [])}
+          onCreate={createWorkspace}
+          onDelete={deleteWorkspace}
+        />
         <nav className="nav-list" aria-label="Main navigation">
           {(['Workspace'] as const).map((group) => <div className="nav-group" key={group}>
             <div className="nav-caption">{group}</div>
@@ -226,14 +331,14 @@ function App() {
         <div className="topbar-left"><button className="icon-button mobile-menu" aria-label="Open navigation" onClick={() => setMobileNav(true)}><Menu size={19} /></button><div className="breadcrumb"><span>Workspace</span><ChevronRight size={14} /><strong>{pageTitles[activePage]}</strong></div></div>
         <div className="topbar-tools">
           <label className="global-search"><Search size={16} /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search this workspace" /><kbd>⌘ K</kbd></label>
-          <span className="example-case-chip">Example case · {selectedInsurer?.name}</span>
+          <span className="example-case-chip">Benchmark · {selectedInsurer?.name}</span>
           <button className="avatar avatar-small" title={user.displayName}>{user.displayName.slice(0, 1)}</button>
         </div>
       </header>
       <div className="page-scroll">
         <div className="page-container">
           <div className="page-heading">
-            <div><div className="eyebrow">BENCH-SUITE <span>/</span> EXAMPLE WORKSPACE</div><h1>{pageTitles[activePage]}</h1><p className="page-description">{descriptionFor(activePage)}</p></div>
+            <div><div className="eyebrow">BENCH-SUITE <span>/</span> {activeWorkspace?.name.toUpperCase()}</div><h1>{pageTitles[activePage]}</h1><p className="page-description">{descriptionFor(activePage)}</p></div>
             <div className="heading-actions">
               <div className={`save-indicator ${saveStatus}`} aria-live="polite">{saveStatus === 'saving' ? <LoaderCircle size={14} className="spin" /> : saveStatus === 'error' ? <AlertCircle size={14} /> : <Check size={14} />}<span>{saveStatus === 'saving' ? 'Saving' : saveStatus === 'error' ? 'Save issue' : 'All changes saved'}</span></div>
               {activePage === 'lifecycle' && <button className="button button-primary" onClick={() => setDialog({ kind: 'process' })}><Plus size={16} /> Add process</button>}
@@ -263,12 +368,62 @@ function App() {
 function descriptionFor(section: SectionId) {
   const text: Record<SectionId, string> = {
     overview: 'A focused GHI process benchmark.', insurers: 'A focused GHI process benchmark.',
-    lifecycle: 'Edit the example GHI process benchmark, add or remove steps, and record simple notes.', 'pain-points': 'Simple notes attached to benchmark steps.',
+    lifecycle: 'Edit this GHI process benchmark, add or remove steps, and record simple notes.', 'pain-points': 'Simple notes attached to benchmark steps.',
     graph: 'Map and edit directed links between benchmark steps.', comparison: 'A focused GHI process benchmark.',
     opportunities: 'Prioritise evidence-backed gaps; unknown assessments remain unscored.', evidence: 'Keep source material connected to the processes it supports.',
     settings: 'Manage collaboration, storage and workspace data.',
   };
   return text[section];
+}
+
+function WorkspaceSwitcher({
+  workspaces, activeWorkspaceId, onSelect, onCreate, onDelete,
+}: {
+  workspaces: WorkspaceRecord[];
+  activeWorkspaceId: string;
+  onSelect: (id: string) => void;
+  onCreate: (name: string) => boolean | void;
+  onDelete: (id: string) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const [creating, setCreating] = useState(false);
+  const [name, setName] = useState('');
+  const active = workspaces.find((record) => record.id === activeWorkspaceId);
+
+  const submit = (event: FormEvent) => {
+    event.preventDefault();
+    const cleanName = name.trim();
+    if (!cleanName) return;
+    if (onCreate(cleanName) === false) return;
+    setName(''); setCreating(false); setOpen(false);
+  };
+
+  return <div className="workspace-switcher">
+    <button className="workspace-chip" aria-expanded={open} aria-label={`Current workspace: ${active?.name ?? 'Select workspace'}`} onClick={() => setOpen((value) => !value)}>
+      <div className="workspace-avatar">{active?.name.slice(0, 1).toUpperCase() ?? 'B'}</div>
+      <div className="workspace-label"><strong>{active?.name ?? 'Choose workspace'}</strong><span>{workspaces.length} {workspaces.length === 1 ? 'workspace' : 'workspaces'}</span></div>
+      <ChevronDown size={15} className={open ? 'workspace-chevron open' : 'workspace-chevron'} />
+    </button>
+    {open && <div className="workspace-menu">
+      <div className="workspace-menu-heading"><span>WORKSPACES</span><button className="icon-button" aria-label="Close workspaces" onClick={() => { setOpen(false); setCreating(false); }}><X size={14} /></button></div>
+      <div className="workspace-options">
+        {workspaces.map((record) => <div key={record.id} className={`workspace-option ${record.id === activeWorkspaceId ? 'selected' : ''}`}>
+          <button className="workspace-option-select" onClick={() => { onSelect(record.id); setOpen(false); }}>
+            <span className="workspace-option-mark">{record.name.slice(0, 1).toUpperCase()}</span>
+            <span className="workspace-option-name">{record.name}</span>
+            {record.id === activeWorkspaceId && <Check size={15} className="workspace-option-check" />}
+          </button>
+          <button className="workspace-option-delete" aria-label={`Delete ${record.name}`} title={workspaces.length === 1 ? 'Keep at least one workspace' : `Delete ${record.name}`} disabled={workspaces.length === 1} onClick={() => onDelete(record.id)}><Trash2 size={14} /></button>
+        </div>)}
+      </div>
+      {creating ? <form className="workspace-create-form" onSubmit={submit}>
+        <label htmlFor="new-workspace-name">Workspace name</label>
+        <input id="new-workspace-name" autoFocus maxLength={60} placeholder="e.g. Claims operations" value={name} onChange={(event) => setName(event.target.value)} />
+        <div className="workspace-create-actions"><button type="button" className="button button-quiet" onClick={() => { setCreating(false); setName(''); }}>Cancel</button><button type="submit" className="button button-primary" disabled={!name.trim()}><Plus size={14} /> Create</button></div>
+      </form> : <button className="workspace-add-button" onClick={() => setCreating(true)}><Plus size={15} /> New workspace</button>}
+      <div className="workspace-menu-foot">Each workspace keeps its own benchmark and workflow graph.</div>
+    </div>}
+  </div>;
 }
 
 function Loading({ label }: { label: string }) {
@@ -328,8 +483,8 @@ function Lifecycle({ state, insurer, processes, subprocesses, expanded, setExpan
   const statusOptions = ['All status', 'Exists', 'Partially Exists', "Doesn't Exist", 'Not Assessed'];
   const toggle = (id: string) => setExpanded(expanded.includes(id) ? expanded.filter((item) => item !== id) : [...expanded, id]);
   return <>
-    <div className="benchmark-summary"><div className="benchmark-summary-title"><div className="insurer-big-mark">EX</div><div><span>EXAMPLE CASE</span><h2>{insurer.name}</h2><p>Illustrative GHI benchmark · no real company data</p></div></div><div className="benchmark-summary-stats"><div><strong>{processes.length}</strong><span>Processes</span></div><div><strong>{active}</strong><span>Subprocesses</span></div><div><strong>{assessed}<small>/{active}</small></strong><span>Assessed</span></div><button className="button button-quiet" onClick={() => setExpanded(expanded.length === processes.length ? [] : processes.map((item) => item.id))}>{expanded.length === processes.length ? 'Collapse all' : 'Expand all'}</button></div></div>
-    <div className="toolbar-card lifecycle-toolbar"><div className="toolbar-copy"><Layers3 size={16} /><strong>{Math.round(assessed / Math.max(active, 1) * 100)}% assessed</strong><span>Example benchmark progress</span></div><div className="toolbar-filters"><label className="filter-control"><ListFilter size={15} /><select value={filter} onChange={(event) => setFilter(event.target.value)}>{statusOptions.map((item) => <option key={item}>{item}</option>)}</select><ChevronDown size={13} /></label></div></div>
+    <div className="benchmark-summary"><div className="benchmark-summary-title"><div className="insurer-big-mark">{insurer.name.slice(0, 2).toUpperCase()}</div><div><span>BENCHMARK CASE</span><h2>{insurer.name}</h2><p>Illustrative GHI process template</p></div></div><div className="benchmark-summary-stats"><div><strong>{processes.length}</strong><span>Processes</span></div><div><strong>{active}</strong><span>Subprocesses</span></div><div><strong>{assessed}<small>/{active}</small></strong><span>Assessed</span></div><button className="button button-quiet" onClick={() => setExpanded(expanded.length === processes.length ? [] : processes.map((item) => item.id))}>{expanded.length === processes.length ? 'Collapse all' : 'Expand all'}</button></div></div>
+    <div className="toolbar-card lifecycle-toolbar"><div className="toolbar-copy"><Layers3 size={16} /><strong>{Math.round(assessed / Math.max(active, 1) * 100)}% assessed</strong><span>Workspace benchmark progress</span></div><div className="toolbar-filters"><label className="filter-control"><ListFilter size={15} /><select value={filter} onChange={(event) => setFilter(event.target.value)}>{statusOptions.map((item) => <option key={item}>{item}</option>)}</select><ChevronDown size={13} /></label></div></div>
     <div className="process-list">{filteredProcesses.map((process, pIndex) => {
       const isOpen = expanded.includes(process.id);
       const children = process.children.filter((sub) => {

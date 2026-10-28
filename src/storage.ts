@@ -18,9 +18,63 @@ const SESSION_KEY = 'bench-suite-user';
 const DEMO_USERS: Record<string, string> = { pankaj: 'Pankaj', sakshi: 'Sakshi', dheeraj: 'Dheeraj', vaibhav: 'Vaibhav' };
 
 export interface WorkspaceSnapshot {
-  state: WorkspaceState;
+  workspaces: WorkspaceRecord[];
   revision: number;
   updatedBy: string;
+}
+
+export interface WorkspaceRecord {
+  id: string;
+  name: string;
+  state: WorkspaceState;
+}
+
+interface WorkspaceCollectionPayload {
+  version: 1;
+  workspaces: WorkspaceRecord[];
+}
+
+function isWorkspaceState(value: unknown): value is WorkspaceState {
+  if (!value || typeof value !== 'object') return false;
+  const candidate = value as Partial<WorkspaceState>;
+  return candidate.schemaVersion === 1 && Array.isArray(candidate.insurers) && Array.isArray(candidate.processes) && Array.isArray(candidate.subprocesses);
+}
+
+function seedRecord(name = 'Example workspace', state = createSeedState()): WorkspaceRecord {
+  return { id: 'example-workspace', name, state };
+}
+
+function normalizeSnapshot(value: unknown, revision = 1, updatedBy = ''): WorkspaceSnapshot {
+  const candidate = value as { workspaces?: unknown; state?: unknown; revision?: unknown; updatedBy?: unknown } | null;
+  if (candidate && Array.isArray(candidate.workspaces)) {
+    const workspaces = candidate.workspaces.filter((record): record is WorkspaceRecord => {
+      if (!record || typeof record !== 'object') return false;
+      const item = record as Partial<WorkspaceRecord>;
+      return typeof item.id === 'string' && typeof item.name === 'string' && isWorkspaceState(item.state);
+    });
+    if (workspaces.length) return {
+      workspaces,
+      revision: Number(candidate.revision ?? revision),
+      updatedBy: typeof candidate.updatedBy === 'string' ? candidate.updatedBy : updatedBy,
+    };
+  }
+
+  // Migrate both the old local snapshot wrapper and the old single-workspace Supabase payload.
+  const legacyState = candidate && isWorkspaceState(candidate.state) ? candidate.state : isWorkspaceState(value) ? value : null;
+  if (legacyState) {
+    const legacyName = legacyState.insurers[0]?.id === 'example-insurer' ? 'Example workspace' : legacyState.insurers[0]?.name || 'Example workspace';
+    return {
+      workspaces: [seedRecord(legacyName, legacyState)],
+      revision: Number(candidate?.revision ?? revision),
+      updatedBy: typeof candidate?.updatedBy === 'string' ? candidate.updatedBy : updatedBy,
+    };
+  }
+
+  return { workspaces: [seedRecord()], revision, updatedBy };
+}
+
+function collectionPayload(snapshot: WorkspaceSnapshot): WorkspaceCollectionPayload {
+  return { version: 1, workspaces: snapshot.workspaces };
 }
 
 function openDb(): Promise<IDBDatabase> {
@@ -37,7 +91,7 @@ async function localGet(): Promise<WorkspaceSnapshot | null> {
   return new Promise((resolve, reject) => {
     const tx = db.transaction(STORE, 'readonly');
     const request = tx.objectStore(STORE).get(LOCAL_KEY);
-    request.onsuccess = () => resolve((request.result as WorkspaceSnapshot | undefined) ?? null);
+    request.onsuccess = () => resolve(request.result === undefined ? null : normalizeSnapshot(request.result));
     request.onerror = () => reject(request.error ?? new Error('Could not read local workspace cache'));
     tx.oncomplete = () => db.close();
   });
@@ -105,20 +159,20 @@ async function fetchRemote(): Promise<WorkspaceSnapshot> {
   if (!supabase) throw new Error('Shared database is not configured.');
   const { data, error } = await supabase.from('workspace_state').select('payload, revision, updated_by').eq('id', 'main').single();
   if (error) throw new Error(`Could not load the shared workspace: ${error.message}`);
-  if (data.payload) return { state: data.payload as WorkspaceState, revision: Number(data.revision), updatedBy: data.updated_by ?? '' };
+  if (data.payload) return normalizeSnapshot(data.payload, Number(data.revision), data.updated_by ?? '');
 
-  const starter = createSeedState();
+  const starter = normalizeSnapshot(null, Number(data.revision));
   try {
     const { data: revision, error: saveError } = await supabase.rpc('save_workspace', {
-      p_payload: starter,
+      p_payload: collectionPayload(starter),
       p_expected_revision: Number(data.revision),
     });
     if (saveError) throw saveError;
-    return { state: starter, revision: Number(revision), updatedBy: '' };
+    return { ...starter, revision: Number(revision) };
   } catch {
     const { data: retry, error: retryError } = await supabase.from('workspace_state').select('payload, revision, updated_by').eq('id', 'main').single();
     if (retryError || !retry?.payload) throw new Error('Could not initialize the shared workspace.');
-    return { state: retry.payload as WorkspaceState, revision: Number(retry.revision), updatedBy: retry.updated_by ?? '' };
+    return normalizeSnapshot(retry.payload, Number(retry.revision), retry.updated_by ?? '');
   }
 }
 
@@ -126,14 +180,14 @@ export async function loadWorkspace(): Promise<WorkspaceSnapshot> {
   if (supabase) return fetchRemote();
   const stored = await localGet();
   if (stored) return stored;
-  const initial = { state: createSeedState(), revision: 1, updatedBy: 'local' };
+  const initial = { workspaces: [seedRecord()], revision: 1, updatedBy: 'local' };
   await localPut(initial);
   return initial;
 }
 
-export async function saveWorkspace(state: WorkspaceState, expectedRevision: number, user: User): Promise<number> {
+export async function saveWorkspace(snapshot: WorkspaceSnapshot, expectedRevision: number, user: User): Promise<number> {
   if (supabase) {
-    const { data, error } = await supabase.rpc('save_workspace', { p_payload: state, p_expected_revision: expectedRevision });
+    const { data, error } = await supabase.rpc('save_workspace', { p_payload: collectionPayload(snapshot), p_expected_revision: expectedRevision });
     if (error) {
       if (error.code === '40001' || error.message.includes('workspace_revision_conflict')) {
         throw new Error('Someone else saved a newer version. The latest workspace is loading; reapply your change after it refreshes.');
@@ -142,14 +196,14 @@ export async function saveWorkspace(state: WorkspaceState, expectedRevision: num
     }
     return Number(data);
   }
-  const snapshot = { state, revision: expectedRevision + 1, updatedBy: user.id };
-  await localPut(snapshot);
+  const nextSnapshot = { ...snapshot, revision: expectedRevision + 1, updatedBy: user.id };
+  await localPut(nextSnapshot);
   if (typeof BroadcastChannel !== 'undefined') {
     const channel = new BroadcastChannel('bench-suite-workspace');
-    channel.postMessage(snapshot);
+    channel.postMessage(nextSnapshot);
     channel.close();
   }
-  return snapshot.revision;
+  return nextSnapshot.revision;
 }
 
 export function subscribeWorkspace(onChange: (snapshot: WorkspaceSnapshot) => void): () => void {
@@ -157,14 +211,14 @@ export function subscribeWorkspace(onChange: (snapshot: WorkspaceSnapshot) => vo
     const channel = supabase.channel('bench-suite-workspace-live').on('postgres_changes', {
       event: 'UPDATE', schema: 'public', table: 'workspace_state', filter: 'id=eq.main',
     }, (payload) => {
-      const row = payload.new as { payload?: WorkspaceState; revision?: number; updated_by?: string };
-      if (row.payload) onChange({ state: row.payload, revision: Number(row.revision), updatedBy: row.updated_by ?? '' });
+      const row = payload.new as { payload?: unknown; revision?: number; updated_by?: string };
+      if (row.payload) onChange(normalizeSnapshot(row.payload, Number(row.revision), row.updated_by ?? ''));
     }).subscribe();
     return () => { void supabase.removeChannel(channel); };
   }
   if (typeof BroadcastChannel === 'undefined') return () => undefined;
   const channel = new BroadcastChannel('bench-suite-workspace');
-  channel.onmessage = (event: MessageEvent<WorkspaceSnapshot>) => onChange(event.data);
+  channel.onmessage = (event: MessageEvent<unknown>) => onChange(normalizeSnapshot(event.data));
   return () => channel.close();
 }
 
