@@ -1,0 +1,16 @@
+node_modules/
+dist/
+coverage/
+.env
+.env.*
+!.env.example
+.vercel/
+playwright-report/
+test-results/
+*.log
+
+.vercel
+recordings/
+node_modules.incomplete/
+node_modules.incomplete/
+*.tsbuildinfo

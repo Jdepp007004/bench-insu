@@ -1,0 +1,9 @@
+node_modules/
+node_modules.incomplete/
+recordings/
+tests/
+scripts/
+coverage/
+playwright-report/
+test-results/
+.env*

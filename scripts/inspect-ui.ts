@@ -1,0 +1,11 @@
+import { chromium } from 'playwright';
+const browser = await chromium.launch({ headless: true });
+const page = await browser.newPage({ viewport: { width: 1440, height: 900 } });
+page.on('console', (message) => console.log('console', message.type(), message.text()));
+page.on('pageerror', (error) => console.log('pageerror', error.message));
+await page.goto('http://127.0.0.1:5173', { waitUntil: 'domcontentloaded' });
+await page.waitForTimeout(1800);
+console.log('title', await page.title());
+console.log('body', (await page.locator('body').innerText()).slice(0, 1600));
+await page.screenshot({ path: 'recordings/inspect-login.png', fullPage: true });
+await browser.close();
